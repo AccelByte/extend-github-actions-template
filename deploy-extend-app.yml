@@ -1,0 +1,258 @@
+name: Deploy Extend App
+
+# Builds this repository's container image, pushes it to the Extend app's own
+# registry, and deploys it. Runs on every push to main, or on demand.
+#
+# Setup lives in the README: three repository variables, two secrets, and a
+# confidential IAM client with the permissions listed there.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image-tag:
+        description: 'Image tag to build and deploy (defaults to the commit SHA)'
+        required: false
+
+# Serialize deploys: only one runs at a time per branch. A new push waits for
+# the in-flight deploy to finish instead of racing it — otherwise two rollouts
+# to the same app could overlap and the older commit could win. cancel-in-progress
+# is false on purpose: killing a rollout mid-flight can leave the app half-updated.
+concurrency:
+  group: deploy-extend-app-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # AGS CLI version to install. Drives both the installer download URL and the
+  # cache key, so bumping this one value is all it takes to move to a new CLI
+  # release — the cache misses and reinstalls automatically.
+  AGS_VERSION: '0.5.1'
+
+  # Your AGS environment base URL, e.g. https://dev.yourstudio.accelbyte.io
+  AGS_BASE_URL: ${{ vars.AGS_BASE_URL }}
+
+  # The namespace the Extend app lives in.
+  AGS_NAMESPACE: ${{ vars.AGS_NAMESPACE }}
+
+  # Name of the Extend app to deploy to. The app must already exist — this
+  # workflow deploys, it does not create.
+  EXTEND_APP: ${{ vars.EXTEND_APP_NAME }}
+
+  # Tag applied to the built image. Defaults to the commit SHA so every deploy
+  # is immutable and traceable, and so rolling back is just re-running this
+  # workflow against an older ref.
+  IMAGE_TAG: ${{ inputs.image-tag || github.sha }}
+
+  # How long to wait for the rollout to reach a terminal state before giving
+  # up. Note this bounds the wait, not the deployment — a timeout does not
+  # stop or roll back a rollout that is still in progress.
+  WAIT_LIMIT: '600'
+
+  # Seconds between rollout status polls.
+  WAIT_INTERVAL: '10'
+
+  # Hosted runners have no OS keychain — no macOS Keychain, no Windows
+  # Credential Manager, no running Linux Secret Service. Skip the keychain
+  # attempt and go straight to file-based token storage.
+  AGS_NO_KEYCHAIN: '1'
+
+  # Select the profile explicitly. AGS_PROFILE is resolved before the CLI's
+  # first-run profile setup, so this works on a clean runner regardless of
+  # what state exists on disk. Without it the CLI fails with
+  # "No active profile".
+  AGS_PROFILE: 'default'
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+
+    # Cap the whole job. WAIT_LIMIT only bounds the rollout step; without this a
+    # hung image build would run until GitHub's 6-hour default kills it, burning
+    # runner minutes. 30 minutes comfortably covers a normal build plus rollout.
+    timeout-minutes: 30
+
+    # This workflow only reads the repository. It never pushes commits, tags,
+    # or releases, so nothing beyond read access is needed.
+    permissions:
+      contents: read
+
+    steps:
+      # Check out the repository. The Docker build context is the repository
+      # root, so this has to happen before the image build.
+      - uses: actions/checkout@v4
+
+      # Fail fast on a misconfigured repository. Without this, a missing
+      # variable surfaces as a confusing CLI error part-way through a deploy;
+      # here it fails in seconds with a message naming exactly what is missing
+      # and where to set it.
+      #
+      # This step also exports AGS_HOME for every step that follows.
+      - name: Check configuration
+        env:
+          # Read the secrets through the environment rather than interpolating
+          # ${{ secrets.* }} straight into the script. Interpolation substitutes
+          # the literal secret value into the command text before bash runs; the
+          # env route keeps the value out of the script and matches how the
+          # Authenticate step below passes credentials.
+          AGS_CLIENT_ID: ${{ secrets.AGS_CLIENT_ID }}
+          AGS_CLIENT_SECRET: ${{ secrets.AGS_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          missing=0
+          # "::error::" is a GitHub workflow command: echoing it both prints the
+          # message and flags it as a red error annotation on the run summary,
+          # so a misconfigured repo is obvious without scanning the logs.
+          check() {
+            if [ -z "${2:-}" ]; then
+              echo "::error::Missing repository variable $1. Set it under Settings → Secrets and variables → Actions → Variables. $3"
+              missing=1
+            fi
+          }
+          check AGS_BASE_URL    "$AGS_BASE_URL"    "Example: https://dev.yourstudio.accelbyte.io"
+          check AGS_NAMESPACE   "$AGS_NAMESPACE"   "Your game namespace."
+          check EXTEND_APP_NAME "$EXTEND_APP"      "The name of an Extend app that already exists."
+          if [ -z "${AGS_CLIENT_ID:-}" ] || [ -z "${AGS_CLIENT_SECRET:-}" ]; then
+            echo "::error::Missing secret AGS_CLIENT_ID and/or AGS_CLIENT_SECRET. Create a confidential IAM client with the permissions listed in the README prerequisites, then store both under Settings → Secrets and variables → Actions → Secrets."
+            missing=1
+          fi
+          [ "$missing" -eq 0 ] || exit 1
+
+          # Each step runs in its own shell, so shell variables do not survive
+          # from one step to the next. To pass data forward you append to the
+          # special files GitHub provides: $GITHUB_ENV (env vars for later
+          # steps), $GITHUB_PATH (PATH additions), $GITHUB_OUTPUT (named step
+          # outputs), and $GITHUB_STEP_SUMMARY (Markdown on the run page). This
+          # workflow uses all four.
+          #
+          # Give the CLI its own state directory, outside the Docker build
+          # context — otherwise the access token sits in the build context and
+          # can end up baked into an image layer. A fresh AGS_HOME also
+          # triggers first-run setup, which creates and selects the default
+          # profile; without it the CLI fails with "No active profile".
+          echo "AGS_HOME=$RUNNER_TEMP/ags-home" >> "$GITHUB_ENV"
+
+          echo "Deploying ${EXTEND_APP} to ${AGS_NAMESPACE} @ ${AGS_BASE_URL} as ${IMAGE_TAG}"
+
+      # Add your tests here if you want them to gate the deploy. Anything that
+      # exits non-zero stops the workflow before any image is built or pushed.
+      #
+      # - name: Test
+      #   run: make test
+
+      # Restore a previously installed CLI from the Actions cache. Without it
+      # the installer downloads the release archive on every run, which adds a
+      # network dependency to the critical path. The key includes AGS_VERSION
+      # because cache entries are immutable — bumping the version produces a
+      # new key, which misses, which installs the new binary. OS and arch are
+      # in the key because the cached artifact is a compiled binary.
+      - name: Cache AGS CLI
+        id: cache-ags
+        uses: actions/cache@v4
+        with:
+          path: ~/.ags-cli
+          key: ags-${{ env.AGS_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      # Install the CLI, but only on a cache miss — a first run, a version
+      # bump, or an expired cache. CARGO_HOME is overridden so the cargo-dist
+      # installer puts the binary in ~/.ags-cli/bin (the directory the cache
+      # step covers) instead of the default ~/.cargo/bin. The curl flags
+      # refuse protocol downgrades, set a TLS floor, and fail on an HTTP error
+      # rather than piping a 404 body into sh.
+      - name: Install AGS CLI
+        if: steps.cache-ags.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="$HOME/.ags-cli"
+          mkdir -p "$CARGO_HOME"
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            "https://github.com/AccelByte/accelbyte-ags-cli/releases/download/v${AGS_VERSION}/accelbyte-ags-cli-installer.sh" \
+            | sh
+
+      # Put the CLI on PATH for subsequent steps. This runs unconditionally and
+      # has to be its own step: writes to $GITHUB_PATH only affect later steps,
+      # and the install step above is skipped entirely on a cache hit.
+      - name: Add AGS CLI to PATH
+        run: echo "$HOME/.ags-cli/bin" >> "$GITHUB_PATH"
+
+      # Authenticate with the confidential IAM client. Credentials are passed
+      # as step-scoped environment variables rather than command-line flags,
+      # since flag values appear in process listings and leak into logs more
+      # easily. --no-input makes the CLI fail instead of prompting.
+      - name: Authenticate
+        env:
+          AGS_CLIENT_ID: ${{ secrets.AGS_CLIENT_ID }}
+          AGS_CLIENT_SECRET: ${{ secrets.AGS_CLIENT_SECRET }}
+        run: ags auth login --grant client-credentials --no-input
+
+      # Build the image and push it to the Extend app's own registry.
+      #
+      # --login mints the registry credentials from the session established
+      # above, so there is no second set of registry credentials to manage.
+      # --platform is pinned because an image built on arm64 starts locally and
+      # then fails on the cluster with "exec format error".
+      - name: Build and push image
+        run: |
+          ags extend image-upload \
+            --namespace "$AGS_NAMESPACE" \
+            --app "$EXTEND_APP" \
+            --image-tag "$IMAGE_TAG" \
+            --work-dir . \
+            --dockerfile Dockerfile \
+            --platform linux/amd64 \
+            --login \
+            --retry-limit 2
+
+      # Create the deployment and poll until the rollout reaches a terminal
+      # state or WAIT_LIMIT expires.
+      #
+      # The exit code is captured rather than allowed to abort the step, so the
+      # Summary step below can report a specific result. It is re-raised at the
+      # end so the job still fails:
+      #   0  deployed  — rollout completed, app healthy
+      #   3  failed    — rollout reached a terminal failure
+      #   6  timed out — WAIT_LIMIT elapsed, rollout may still be in progress
+      - name: Deploy and wait for rollout
+        id: deploy
+        run: |
+          set -uo pipefail
+          set +e
+          # deploy-app is a shim onto the generated `csm deployments create`
+          # operation, so the image tag goes in the request body rather than
+          # a flag. (image-upload above is hand-written and takes --image-tag.)
+          ags extend deploy-app \
+            --namespace "$AGS_NAMESPACE" \
+            --app "$EXTEND_APP" \
+            --json "$(printf '{"imageTag":"%s"}' "$IMAGE_TAG")" \
+            --wait --wait-limit "$WAIT_LIMIT" --wait-interval "$WAIT_INTERVAL" \
+            --api-scope admin --api-version v5 \
+            --format json --no-input --yes
+          code=$?
+          set -e
+          echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+          case "$code" in
+            0) echo "result=deployed"  >> "$GITHUB_OUTPUT" ;;
+            6) echo "result=timed out" >> "$GITHUB_OUTPUT" ;;
+            *) echo "result=failed"    >> "$GITHUB_OUTPUT" ;;
+          esac
+          exit "$code"
+
+      # Write the outcome to the run page so it is readable without opening
+      # the logs. Runs on failure too, which is when it matters most.
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Extend App Deployment"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| App | \`${EXTEND_APP}\` |"
+            echo "| Namespace | \`${AGS_NAMESPACE}\` |"
+            echo "| Image tag | \`${IMAGE_TAG}\` |"
+            echo "| Result | ${{ steps.deploy.outputs.result || 'did not run' }} |"
+            case "${{ steps.deploy.outputs.exit-code }}" in
+              3) echo ""; echo "> The rollout failed. Check the app logs before retrying." ;;
+              6) echo ""; echo "> The wait timed out after ${WAIT_LIMIT}s. The deployment may still complete — check the app status before redeploying." ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"
