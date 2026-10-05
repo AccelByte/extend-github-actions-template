@@ -1,0 +1,217 @@
+name: 'Setup AGS CLI'
+description: 'Install and cache AccelByte AGS CLI on a runner, and optionally authenticate it, so later steps can run bare `ags` commands.'
+author: 'AccelByte'
+
+# Shown on the Marketplace listing card. Icons come from the Feather v4.28.0 set;
+# color must be one of white, black, yellow, blue, green, orange, red, purple, gray-dark.
+branding:
+  icon: 'terminal'
+  color: 'blue'
+
+inputs:
+  version:
+    description: 'AGS CLI version to install, e.g. 0.5.1. A leading "v" is accepted. "latest" resolves the newest release at run time — pin a version for reproducible builds.'
+    required: false
+    default: 'latest'
+
+  # Credentials are optional: installing the CLI is useful on its own (`ags
+  # --version`, code generation, docs tooling). Pass both to have this action
+  # log in; pass neither to install only.
+  base-url:
+    description: 'AGS environment base URL, e.g. https://dev.yourstudio.accelbyte.io. Exported as AGS_BASE_URL for later steps. Required to authenticate.'
+    required: false
+    default: ''
+  client-id:
+    description: 'Confidential IAM client ID. Pass this from a secret, never a literal. Omit along with client-secret to skip authentication.'
+    required: false
+    default: ''
+  client-secret:
+    description: 'Confidential IAM client secret. Pass this from a secret, never a literal.'
+    required: false
+    default: ''
+
+  github-token:
+    description: 'Token used only to resolve version "latest" through the GitHub API. The default is enough; the unauthenticated API allows 60 requests per hour per IP, and hosted runners share IPs.'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  version:
+    description: 'The concrete version installed, after "latest" is resolved. Use this to pin a later build to the same CLI.'
+    value: ${{ steps.resolve.outputs.version }}
+  cache-hit:
+    description: 'true when the CLI was restored from cache rather than downloaded.'
+    value: ${{ steps.cache.outputs.cache-hit }}
+
+runs:
+  using: 'composite'
+  steps:
+    # Resolve the version before the cache step, because the cache key contains
+    # it. "latest" therefore costs one API call even on a cache hit — the price
+    # of not having a version string that silently rots. Pin `version` to skip
+    # the call entirely.
+    - name: Resolve version
+      id: resolve
+      shell: bash
+      env:
+        REQUESTED_VERSION: ${{ inputs.version }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+
+        # The installer is a POSIX shell script. Fail with a clear message
+        # rather than letting curl pipe into a shell that isn't there.
+        if [ "${RUNNER_OS}" = "Windows" ]; then
+          echo "::error::setup-ags-cli supports Linux and macOS runners. RUNNER_OS is '${RUNNER_OS}'."
+          exit 1
+        fi
+
+        version="${REQUESTED_VERSION:-latest}"
+
+        if [ "$version" = "latest" ]; then
+          auth=()
+          if [ -n "${GH_TOKEN:-}" ]; then
+            auth=(-H "Authorization: Bearer ${GH_TOKEN}")
+          fi
+          tag="$(curl --proto '=https' --tlsv1.2 -fsSL "${auth[@]}" \
+            -H 'Accept: application/vnd.github+json' \
+            https://api.github.com/repos/AccelByte/accelbyte-ags-cli/releases/latest \
+            | jq -r '.tag_name')"
+          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+            echo "::error::Could not resolve the latest AGS CLI release. Pin the 'version' input to a known release, e.g. version: '0.5.1'."
+            exit 1
+          fi
+          version="$tag"
+        fi
+
+        # Accept both "0.5.1" and "v0.5.1". The release tag carries the v, the
+        # installer URL is built from it, and a caller who guesses wrong would
+        # otherwise get an opaque 404.
+        version="${version#v}"
+
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "Using AGS CLI $version"
+
+    # The cached artifact is a compiled binary, so OS and arch belong in the
+    # key alongside the version. Cache entries are immutable: a version bump
+    # produces a new key, which misses, which installs the new binary.
+    - name: Cache AGS CLI
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.ags-cli
+        key: ags-${{ steps.resolve.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+    # Install only on a cache miss — a first run, a version bump, or an expired
+    # cache. CARGO_HOME is overridden so the cargo-dist installer puts the
+    # binary in ~/.ags-cli/bin (the directory the cache step covers) instead of
+    # the default ~/.cargo/bin. The curl flags refuse protocol downgrades, set a
+    # TLS floor, and fail on an HTTP error rather than piping a 404 body to sh.
+    - name: Install AGS CLI
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        AGS_VERSION: ${{ steps.resolve.outputs.version }}
+      run: |
+        set -euo pipefail
+        export CARGO_HOME="$HOME/.ags-cli"
+        mkdir -p "$CARGO_HOME"
+        curl --proto '=https' --tlsv1.2 -LsSf \
+          "https://github.com/AccelByte/accelbyte-ags-cli/releases/download/v${AGS_VERSION}/accelbyte-ags-cli-installer.sh" \
+          | sh
+
+    # Put `ags` on PATH and export the environment it needs. For a setup-*
+    # action this leak into the caller's job is the contract, not a mistake:
+    # the whole point is that their later steps run bare `ags` commands without
+    # knowing any of this.
+    #
+    # Credentials are deliberately NOT exported. The login below leaves a token
+    # in AGS_HOME; later steps read that, so the client secret never becomes
+    # job-wide environment.
+    - name: Configure environment
+      shell: bash
+      env:
+        BASE_URL: ${{ inputs.base-url }}
+      run: |
+        set -euo pipefail
+
+        echo "$HOME/.ags-cli/bin" >> "$GITHUB_PATH"
+
+        # Keep CLI state out of the repository checkout. A token written inside
+        # the Docker build context can end up baked into an image layer.
+        echo "AGS_HOME=${RUNNER_TEMP}/ags-home" >> "$GITHUB_ENV"
+
+        # Hosted runners have no OS keychain — no macOS Keychain, no Windows
+        # Credential Manager, no running Linux Secret Service. Skip the keychain
+        # attempt and go straight to file-based token storage.
+        echo "AGS_NO_KEYCHAIN=1" >> "$GITHUB_ENV"
+
+        # AGS_PROFILE is resolved before the CLI's first-run profile setup, so
+        # this works on a clean runner regardless of what state exists on disk.
+        # Without it the CLI fails with "No active profile".
+        echo "AGS_PROFILE=default" >> "$GITHUB_ENV"
+
+        if [ -n "${BASE_URL:-}" ]; then
+          echo "AGS_BASE_URL=${BASE_URL}" >> "$GITHUB_ENV"
+        fi
+
+    # Authenticate with the confidential IAM client, if credentials were given.
+    #
+    # Composite actions do NOT enforce `required: true`, and these inputs are
+    # optional by design, so the three-way check below is the only guard: both
+    # credentials means log in, neither means install-only, exactly one is
+    # almost certainly a mistake worth failing on.
+    - name: Authenticate
+      shell: bash
+      env:
+        # These three names are not arbitrary: AGS CLI reads the credentials and
+        # the base URL from exactly these variables, so `ags auth login` below
+        # needs no flags. Renaming them breaks authentication silently — the
+        # login simply runs with nothing to authenticate with.
+        #
+        # They are also the reason credentials are passed through the
+        # environment rather than interpolated into the script body:
+        # interpolation would substitute the literal secret into the command
+        # text before bash runs.
+        #
+        # Step-scoped on purpose. AGS_HOME, AGS_PROFILE and AGS_NO_KEYCHAIN
+        # reach this step from $GITHUB_ENV, but the credentials deliberately do
+        # not — they exist here and nowhere else.
+        AGS_CLIENT_ID: ${{ inputs.client-id }}
+        AGS_CLIENT_SECRET: ${{ inputs.client-secret }}
+        AGS_BASE_URL: ${{ inputs.base-url }}
+      run: |
+        set -euo pipefail
+
+        # Values that came from `secrets.*` are already masked, but a caller
+        # passing a literal or a value read from a file gets no masking for
+        # free, and it would otherwise land in the logs.
+        if [ -n "${AGS_CLIENT_SECRET:-}" ]; then
+          echo "::add-mask::$AGS_CLIENT_SECRET"
+        fi
+
+        if [ -z "${AGS_CLIENT_ID:-}" ] && [ -z "${AGS_CLIENT_SECRET:-}" ]; then
+          echo "AGS CLI installed. No credentials supplied, skipping login."
+          exit 0
+        fi
+
+        missing=0
+        # "::error::" is a GitHub workflow command: echoing it both prints the
+        # message and flags it as a red error annotation on the run summary, so
+        # a misconfigured caller is obvious without scanning the logs.
+        if [ -z "${AGS_CLIENT_ID:-}" ]; then
+          echo "::error::client-secret was supplied without client-id. Pass both from repository secrets."
+          missing=1
+        fi
+        if [ -z "${AGS_CLIENT_SECRET:-}" ]; then
+          echo "::error::client-id was supplied without client-secret. Pass both from repository secrets."
+          missing=1
+        fi
+        if [ -z "${AGS_BASE_URL:-}" ]; then
+          echo "::error::base-url is required to authenticate. Example: https://dev.yourstudio.accelbyte.io"
+          missing=1
+        fi
+        [ "$missing" -eq 0 ] || exit 1
+
+        ags auth login --grant client-credentials --no-input
+        echo "Authenticated against ${AGS_BASE_URL}"

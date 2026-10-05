@@ -4,6 +4,8 @@ A GitHub Actions workflow that builds your Extend app's container image, pushes 
 
 It runs [AGS CLI](https://github.com/AccelByte/accelbyte-ags-cli) on a standard GitHub-hosted runner. The workflow is a plain YAML file you copy into your own repository and edit.
 
+Installing and authenticating the CLI is delegated to [`AccelByte/setup-ags-cli`](https://github.com/AccelByte/setup-ags-cli), because those steps carry runner-specific workarounds that are ours to maintain rather than yours. Everything else — when to deploy, what to build, how to report the result — lives in this file, in the open, for you to change.
+
 ```
 push to main  →  build image  →  push to app registry  →  deploy  →  wait for rollout
 ```
@@ -66,12 +68,46 @@ Tunable values live in the `env:` block at the top of the workflow.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `AGS_VERSION` | `0.5.1` | AGS CLI version to install. Drives both the download URL and the cache key. |
+| `AGS_VERSION` | `0.5.1` | AGS CLI version to install. Passed to the setup action, which uses it in its cache key. Set to `latest` to always take the newest release. |
 | `WAIT_LIMIT` | `600` | Seconds to wait for the rollout before giving up. |
 | `WAIT_INTERVAL` | `10` | Seconds between rollout status polls. |
 | `IMAGE_TAG` | commit SHA | Tag applied to the built image. |
 
-> **On pinning.** `AGS_VERSION` fixes the CLI version rather than tracking the latest release. Upgrading is then a deliberate one-line edit, not something that lands in your pipeline unannounced.
+> **On pinning.** `AGS_VERSION` fixes the CLI rather than tracking the latest release, so upgrading is a deliberate one-line edit instead of something that lands in your pipeline unannounced — and re-running an old commit installs the CLI that commit was tested with. Set it to `latest` if you would rather have the newest release and don't need reproducible builds.
+
+### Keeping the pinned version current
+
+A pin only stays useful if someone bumps it. Dependabot won't: it updates `uses:` references, not the value of an arbitrary environment variable, so `AGS_VERSION` is invisible to it and will quietly go stale.
+
+[Renovate](https://docs.renovatebot.com/) can track it, with a custom manager in your `renovate.json`:
+
+```json
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": [".github/workflows/deploy-extend-app.yml"],
+      "matchStrings": ["AGS_VERSION:\\s*['\"]?(?<currentValue>\\d+\\.\\d+\\.\\d+)['\"]?"],
+      "depNameTemplate": "AccelByte/accelbyte-ags-cli",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver",
+      "extractVersionTemplate": "^v(?<version>.+)$"
+    }
+  ]
+}
+```
+
+You'll get a pull request per AGS CLI release, with the changelog attached — so the upgrade stays a deliberate decision, it just arrives on your doorstep instead of waiting to be remembered.
+
+Three details in there are load-bearing:
+
+- **`extractVersionTemplate`** strips the leading `v`. Releases are tagged `v0.5.1` but the env var holds `0.5.1`; without this Renovate would write the tag verbatim and the installer URL would end up looking for `vv0.5.1`.
+- **The `\\d+\\.\\d+\\.\\d+` requirement** means `AGS_VERSION: 'latest'` isn't matched at all. If you switch to tracking latest, Renovate ignores the line instead of trying to "upgrade" the word `latest`. The quotes are optional in the pattern, so an unquoted `AGS_VERSION: 0.5.1` is still tracked.
+- **`managerFilePatterns`** is the current field name — older Renovate configs call it `fileMatch`, which still works but is deprecated. A bare string is treated as a glob; wrap it in `/.../` if you want a regex.
+
+The `uses: AccelByte/setup-ags-cli@v1` reference needs no custom rule. `@v1` is a floating major tag, so bug fixes arrive without any version change at all. If you'd rather pin it exactly — `@v1.2.3` — Renovate's and Dependabot's built-in GitHub Actions managers both handle that automatically.
 
 ### Concurrency and timeout
 
@@ -80,86 +116,26 @@ Two job-level safety settings sit outside the `env:` block:
 - **`concurrency`** serializes deploys per branch, with `cancel-in-progress: false`. If a second push lands while a deploy is still running, it waits for the first to finish rather than racing it — two rollouts to the same app can't overlap, and an in-flight rollout is never cancelled part-way through (which could leave the app half-updated).
 - **`timeout-minutes: 30`** caps the whole job. `WAIT_LIMIT` only bounds the rollout step; this covers the case where the image build itself hangs, so a stuck run can't run up to GitHub's 6-hour default before it's killed.
 
-## How AGS CLI gets installed
+## AGS CLI setup
 
-Three steps handle this: cache, install, and PATH.
-
-### Cache AGS CLI
+One step installs the CLI, caches it, and logs in:
 
 ```yaml
-- name: Cache AGS CLI
-  id: cache-ags
-  uses: actions/cache@v4
-  with:
-    path: ~/.ags-cli
-    key: ags-${{ env.AGS_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Setup AGS CLI
+        id: setup
+        uses: AccelByte/setup-ags-cli@v1
+        with:
+          version: ${{ env.AGS_VERSION }}
+          base-url: ${{ vars.AGS_BASE_URL }}
+          client-id: ${{ secrets.AGS_CLIENT_ID }}
+          client-secret: ${{ secrets.AGS_CLIENT_SECRET }}
 ```
 
-Every workflow run starts on a clean runner, so without a cache the CLI archive is downloaded from GitHub Releases on every single deploy. Caching it means that download happens only on the first run and after a version bump — not on every deploy — so a slow or unavailable GitHub Releases endpoint won't fail an otherwise-cached deploy.
+Afterwards `ags` is on `PATH` and `AGS_BASE_URL`, `AGS_HOME`, `AGS_PROFILE` and `AGS_NO_KEYCHAIN` are set for every later step — which is why the commands further down are plain CLI calls with no environment blocks of their own.
 
-`~/.ags-cli` is where the install step puts the binary (see below).
+Those four variables exist to work around things that are true of GitHub-hosted runners: no OS keychain, no CLI state directory, and a token that has to stay out of the Docker build context. The action owns them so that a fix reaches you by bumping a tag rather than by you editing this file.
 
-The cache key is worth understanding, because it is what makes version upgrades work without any manual cache clearing:
-
-- **`AGS_VERSION`** — a cache entry is immutable once written; GitHub will not overwrite an existing key. Putting the version in the key means bumping `AGS_VERSION` produces a new key, which misses, which triggers a fresh install of the new version. Leave the version out and you would be pinned to whatever binary was cached first, forever.
-- **`runner.os` / `runner.arch`** — the cached artifact is a compiled binary. A Linux x86_64 build is not valid on any other target. If you ever add a matrix or move to a different runner image, the key changes with it.
-
-The step sets `steps.cache-ags.outputs.cache-hit` to `'true'` only on an exact key match.
-
-### Install AGS CLI
-
-```yaml
-- name: Install AGS CLI
-  if: steps.cache-ags.outputs.cache-hit != 'true'
-  run: |
-    set -euo pipefail
-    export CARGO_HOME="$HOME/.ags-cli"
-    mkdir -p "$CARGO_HOME"
-    curl --proto '=https' --tlsv1.2 -LsSf \
-      "https://github.com/AccelByte/accelbyte-ags-cli/releases/download/v${AGS_VERSION}/accelbyte-ags-cli-installer.sh" \
-      | sh
-```
-
-This runs only on a cache miss — a first run, a version bump, or an expired cache. On a hit it is skipped entirely.
-
-- **`CARGO_HOME`** — the installer is a `cargo-dist` shell installer, which installs into `$CARGO_HOME/bin`. Overriding it redirects the binary into `~/.ags-cli/bin` instead of the default `~/.cargo/bin`, so it lands inside the directory the cache step covers. The two paths have to agree or the cache does nothing.
-- **`--proto '=https' --tlsv1.2`** — refuse any protocol downgrade and set a TLS floor. Standard hygiene for a `curl | sh` install.
-- **`-f`** — fail on an HTTP error response. Without it, a 404 body gets piped straight into `sh`, which is both useless and unsafe.
-- **`-L`** — follow redirects. GitHub release assets redirect to a CDN.
-- **`v${AGS_VERSION}`, not `latest`** — the download URL pins an exact version (the "On pinning" note above explains why).
-
-### Add AGS CLI to PATH
-
-```yaml
-- name: Add AGS CLI to PATH
-  run: echo "$HOME/.ags-cli/bin" >> "$GITHUB_PATH"
-```
-
-This one runs unconditionally, and it has to be its own step: a write to `$GITHUB_PATH` only affects *later* steps, not the step doing the writing, and the install step doesn't run on a cache hit — so PATH setup can't live inside it.
-
-## Runner state and authentication
-
-Three environment variables exist to make the CLI behave on a clean runner.
-
-| Variable | Why |
-| --- | --- |
-| `AGS_NO_KEYCHAIN=1` | Hosted runners have no OS keychain — no macOS Keychain, no Windows Credential Manager, no running Linux Secret Service. Setting this goes straight to file-based token storage instead of attempting a keychain call that will fail. |
-| `AGS_PROFILE=default` | Resolved before the CLI's first-run profile setup, so it works on a clean runner regardless of what is on disk. Without it the CLI fails with `No active profile`. |
-| `AGS_HOME=$RUNNER_TEMP/ags-home` | Puts CLI state — including the access token — in a temp directory **outside the repository**. |
-
-> **Why `AGS_HOME` matters more than it looks.** The image build uses the repository root as its Docker build context. Any CLI state written inside the repository would be visible to the build and could end up baked into an image layer. Pointing `AGS_HOME` at `$RUNNER_TEMP` keeps the token out of the build context entirely. Don't move it into the workspace.
-
-Authentication is the standard client-credentials flow:
-
-```yaml
-- name: Authenticate
-  env:
-    AGS_CLIENT_ID: ${{ secrets.AGS_CLIENT_ID }}
-    AGS_CLIENT_SECRET: ${{ secrets.AGS_CLIENT_SECRET }}
-  run: ags auth login --grant client-credentials --no-input
-```
-
-The credentials are passed as environment variables scoped to this single step, not as command-line flags — flag values show up in process listings and are easier to leak into logs. `--no-input` makes the CLI fail rather than prompt if anything is missing.
+**If you want the detail** — how the cache key is built, why `CARGO_HOME` is overridden, why the token must not live in the workspace, what the action deliberately does *not* export — it's all in [the action's README](https://github.com/AccelByte/setup-ags-cli#how-the-cli-gets-installed). You don't need it to use this workflow, but read it before you work around anything.
 
 ## Build and push
 
@@ -198,7 +174,7 @@ One command builds the image and pushes it to the app's own registry. `--login` 
 
 `deploy-app` takes the image tag in a JSON request body (`--json`) rather than as a flag.
 
-`--wait` polls until the rollout reaches a terminal state or the wait limit expires. The step captures the exit code and maps it to a human-readable result:
+`--wait` polls until the rollout reaches a terminal state or the wait limit expires. The step captures the exit code with `|| code=$?` and re-raises it on the last line, so the run still goes red on a failed deploy; the `Summary` step then maps that code to a human-readable result:
 
 | Exit code | Result | Meaning |
 | --- | --- | --- |
@@ -235,11 +211,11 @@ The workflow also has a `workflow_dispatch` trigger. Under **Actions → Deploy 
 | Symptom | Cause and fix |
 | --- | --- |
 | `Missing repository variable …` or `Missing secret …` | The config check found something unset. The message names which one and where to set it. |
-| `No active profile` | `AGS_PROFILE` or `AGS_HOME` was removed from the `env:` block. Both are required on a clean runner. |
+| `No active profile` | An `ags` command ran before the `Setup AGS CLI` step, so `AGS_PROFILE` and `AGS_HOME` weren't set yet. Move it after that step. |
 | Image builds, app never becomes healthy | Usually a crash at startup — a missing environment variable or config the app needs at boot. Check the app logs in the Admin Portal. |
 | `exec format error` in the app logs | Architecture mismatch. Confirm `--platform linux/amd64` is still present and that your base image has an `amd64` variant. |
-| Auth fails at the login step | Confirm the IAM client is **Confidential**, not Public, and that `AGS_BASE_URL` points at the right environment. |
-| CLI version bump doesn't take effect | The cache key includes `AGS_VERSION`, so this normally resolves itself. If the key was edited, clear the entry under **Actions → Caches**. |
+| Auth fails in the `Setup AGS CLI` step | Confirm the IAM client is **Confidential**, not Public, and that `AGS_BASE_URL` points at the right environment. |
+| CLI version bump doesn't take effect | Change `version` on the `Setup AGS CLI` step, not an `env:` var. The cache key includes it, so the bump takes effect on the next run. |
 | Deploy rejected as unauthorized | The IAM client is missing a permission. Compare it against the list in the prerequisites — the error response names the permission string it expected. |
 
 Run `ags doctor` locally against the same base URL and client to check config, auth, and connectivity independently of CI.
@@ -248,6 +224,6 @@ Run `ags doctor` locally against the same base URL and client to check config, a
 
 - `AGS_CLIENT_SECRET` is a long-lived credential in a repository. Rotate it periodically and on personnel changes.
 - Grant only the permissions listed in the prerequisites, scoped to one namespace. If the secret is compromised, the blast radius is whatever you granted it — and that list deliberately cannot delete the app.
-- Keep `AGS_HOME` outside the workspace — see [Runner state and authentication](#runner-state-and-authentication) for why.
+- `AGS_HOME` is kept outside the workspace by `setup-ags-cli`, so the access token can't be baked into an image layer — see [Runner state and authentication](https://github.com/AccelByte/setup-ags-cli#runner-state-and-authentication) for why that matters.
 - Never move credentials from `secrets` into `vars`. Repository variables are not masked in logs.
 - The `permissions: contents: read` block at the job level is intentional — this workflow never needs write access to the repository.
