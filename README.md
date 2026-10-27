@@ -10,7 +10,7 @@ Installing and authenticating the CLI is delegated to [`AccelByte/setup-ags-cli`
 push to main  →  build image  →  push to app registry  →  deploy  →  wait for rollout
 ```
 
-Workflow file: `.github/workflows/deploy-extend-app.yml`
+Workflow file: [`deploy-extend-app.yml`](deploy-extend-app.yml) in this repository. Copy it into your own repository as `.github/workflows/deploy-extend-app.yml`. It sits at the root here, not under `.github/workflows`, so that it doesn't run against this repository.
 
 > **New to GitHub Actions?** A *workflow* is this YAML file. GitHub reads it automatically and runs it on the events listed at the top — here, a push to `main` or a manual trigger. Each run executes on a *runner*: a fresh, temporary Linux machine GitHub provides, so nothing is installed on your own computer and every run starts from a clean slate. A workflow is made of *jobs*, and each job is a list of *steps* that run top to bottom. You don't install or host anything — commit the file and GitHub takes it from there.
 
@@ -35,7 +35,7 @@ Workflow file: `.github/workflows/deploy-extend-app.yml`
 
 ### 1. Add the workflow file to your repository
 
-The workflow must live at `.github/workflows/deploy-extend-app.yml` on your repository's default branch. If you started from the sample app, it's already there — skip to the next step. If you're adding deployment to your own repo, copy that file into the same path and commit it. GitHub only picks up a workflow once the file is committed to the branch, so it won't appear under the **Actions** tab until then.
+Copy `deploy-extend-app.yml` from this repository to `.github/workflows/deploy-extend-app.yml` on your repository's default branch. If you started from an Extend sample app that already includes it, skip to the next step. Otherwise, commit the file. GitHub only picks up a workflow once the file is committed to the branch, so it won't appear under the **Actions** tab until then.
 
 ### 2. Add repository variables
 
@@ -68,16 +68,16 @@ Tunable values live in the `env:` block at the top of the workflow.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `AGS_VERSION` | `0.5.1` | AGS CLI version to install. Passed to the setup action, which uses it in its cache key. Set to `latest` to always take the newest release. |
+| `AGS_VERSION` | `latest` | AGS CLI version to install. Passed to the setup action, which uses it in its cache key. Pin an exact version — `0.5.3` — for reproducible builds. |
 | `WAIT_LIMIT` | `600` | Seconds to wait for the rollout before giving up. |
 | `WAIT_INTERVAL` | `10` | Seconds between rollout status polls. |
 | `IMAGE_TAG` | commit SHA | Tag applied to the built image. |
 
-> **On pinning.** `AGS_VERSION` fixes the CLI rather than tracking the latest release, so upgrading is a deliberate one-line edit instead of something that lands in your pipeline unannounced — and re-running an old commit installs the CLI that commit was tested with. Set it to `latest` if you would rather have the newest release and don't need reproducible builds.
+> **On versions.** The default is `latest`, so CLI fixes arrive without anyone editing the workflow. The trade-off is reproducibility: re-running an old commit installs today's CLI rather than the one that commit was tested with — so a rollback rebuilds with a different tool than the original deploy used — and a CLI regression can reach your deploys without you choosing it. Pin an exact version if you need either guarantee.
 
-### Keeping the pinned version current
+### If you pin, keeping the version current
 
-A pin only stays useful if someone bumps it. Dependabot won't: it updates `uses:` references, not the value of an arbitrary environment variable, so `AGS_VERSION` is invisible to it and will quietly go stale.
+This section only applies if you replaced `latest` with an exact version. A pin only stays useful if someone bumps it. Dependabot won't: it updates `uses:` references, not the value of an arbitrary environment variable, so `AGS_VERSION` is invisible to it and will quietly go stale.
 
 [Renovate](https://docs.renovatebot.com/) can track it, with a custom manager in your `renovate.json`:
 
@@ -103,17 +103,17 @@ You'll get a pull request per AGS CLI release, with the changelog attached — s
 
 Three details in there are load-bearing:
 
-- **`extractVersionTemplate`** strips the leading `v`. Releases are tagged `v0.5.1` but the env var holds `0.5.1`; without this Renovate would write the tag verbatim and the installer URL would end up looking for `vv0.5.1`.
-- **The `\\d+\\.\\d+\\.\\d+` requirement** means `AGS_VERSION: 'latest'` isn't matched at all. If you switch to tracking latest, Renovate ignores the line instead of trying to "upgrade" the word `latest`. The quotes are optional in the pattern, so an unquoted `AGS_VERSION: 0.5.1` is still tracked.
+- **`extractVersionTemplate`** strips the leading `v`. Releases are tagged `v0.5.3` but the env var holds `0.5.3`. Without this, Renovate would write `AGS_VERSION: 'v0.5.4'`; the setup action would cope with that, but the `\\d+\\.\\d+\\.\\d+` pattern above requires a leading digit, so Renovate would stop matching the line and silently stop tracking it after the first update.
+- **The `\\d+\\.\\d+\\.\\d+` requirement** means `AGS_VERSION: 'latest'` isn't matched at all. If you switch to tracking latest, Renovate ignores the line instead of trying to "upgrade" the word `latest`. The quotes are optional in the pattern, so an unquoted `AGS_VERSION: 0.5.3` is still tracked.
 - **`managerFilePatterns`** is the current field name — older Renovate configs call it `fileMatch`, which still works but is deprecated. A bare string is treated as a glob; wrap it in `/.../` if you want a regex.
 
-The `uses: AccelByte/setup-ags-cli@v1` reference needs no custom rule. `@v1` is a floating major tag, so bug fixes arrive without any version change at all. If you'd rather pin it exactly — `@v1.2.3` — Renovate's and Dependabot's built-in GitHub Actions managers both handle that automatically.
+The `uses: AccelByte/setup-ags-cli@v1` reference needs no custom rule. `@v1` is a floating major tag, so bug fixes arrive without any version change at all. If you'd rather pin it exactly — `@v1.2.3` — Renovate's built-in GitHub Actions manager handles that automatically, and so does Dependabot once you enable it for Actions with a `package-ecosystem: github-actions` entry in `.github/dependabot.yml`.
 
 ### Concurrency and timeout
 
 Two job-level safety settings sit outside the `env:` block:
 
-- **`concurrency`** serializes deploys per branch, with `cancel-in-progress: false`. If a second push lands while a deploy is still running, it waits for the first to finish rather than racing it — two rollouts to the same app can't overlap, and an in-flight rollout is never cancelled part-way through (which could leave the app half-updated).
+- **`concurrency`** serializes deploys per app (namespace plus app name), whichever branch or tag they run from, with `cancel-in-progress: false`. If a second run starts while a deploy is still running, it waits for the first to finish rather than racing it — two rollouts to the same app can't overlap, and an in-flight rollout is never cancelled part-way through (which could leave the app half-updated). GitHub keeps only the newest waiting run, so if several pushes queue up behind one deploy, the older waiting ones are dropped and the newest commit is what gets deployed.
 - **`timeout-minutes: 30`** caps the whole job. `WAIT_LIMIT` only bounds the rollout step; this covers the case where the image build itself hangs, so a stuck run can't run up to GitHub's 6-hour default before it's killed.
 
 ## AGS CLI setup
@@ -182,6 +182,7 @@ One command builds the image and pushes it to the app's own registry. `--login` 
 | `3` | failed | Rollout reached a terminal failure. Check the app logs before retrying. |
 | `6` | timed out | `WAIT_LIMIT` elapsed with the rollout still in progress. |
 | other | failed | Something else went wrong — a bad request, an auth failure, a network error. |
+| none | did not run | An earlier step failed, so the deploy step never started. The failing step is named on the run page. |
 
 > **Exit `6` is not a rollback.** A timeout means CI stopped watching, not that the deployment stopped. The rollout may still succeed a minute later. Check the app's actual status before redeploying, or you risk stacking a second deployment on top of one that was about to finish. If your app is legitimately slow to start, raise `WAIT_LIMIT` rather than treating timeouts as normal.
 
@@ -200,11 +201,11 @@ Anything that exits non-zero there stops the workflow before any image is built 
 
 ## Manual deploy and rollback
 
-The workflow also has a `workflow_dispatch` trigger. Under **Actions → Deploy Extend App → Run workflow** you can choose a ref and optionally override the image tag.
+The workflow also has a `workflow_dispatch` trigger. Under **Actions → Deploy Extend App → Run workflow** you can choose a branch or tag and optionally override the image tag. The picker lists branches and tags only, not individual commits, and the chosen ref must already contain this workflow file.
 
-**To roll back:** select the last known-good commit or tag as the ref and leave the image tag input empty. The workflow checks out that ref, rebuilds it, tags it with that commit's SHA, and deploys it.
+**To roll back:** tag the last known-good commit (or create a branch on it), select that tag or branch in the picker, and leave the image tag input empty. The workflow checks out that ref, rebuilds it, tags the image with that commit's SHA, and deploys it.
 
-> **Watch the image-tag override.** The tag input does not choose *what* to build — it only labels whatever the selected ref contains. Running against `main` with an older SHA typed into the tag field will build current `main` and push it under a misleading tag. Use the ref selector for rollback; use the tag input only when you want a non-SHA label such as a release tag.
+> **Watch the image-tag override.** The tag input does not choose *what* to build — it only labels whatever the selected ref contains. Running against `main` with an older SHA typed into the tag field will build current `main` and push it under a misleading tag. Use the ref selector for rollback; use the tag input only when you want a non-SHA label such as a release tag. The tag may contain letters, digits, `_`, `.` and `-` (up to 128 characters); the first step rejects anything else.
 
 ## Troubleshooting
 
@@ -215,7 +216,7 @@ The workflow also has a `workflow_dispatch` trigger. Under **Actions → Deploy 
 | Image builds, app never becomes healthy | Usually a crash at startup — a missing environment variable or config the app needs at boot. Check the app logs in the Admin Portal. |
 | `exec format error` in the app logs | Architecture mismatch. Confirm `--platform linux/amd64` is still present and that your base image has an `amd64` variant. |
 | Auth fails in the `Setup AGS CLI` step | Confirm the IAM client is **Confidential**, not Public, and that `AGS_BASE_URL` points at the right environment. |
-| CLI version bump doesn't take effect | Change `version` on the `Setup AGS CLI` step, not an `env:` var. The cache key includes it, so the bump takes effect on the next run. |
+| CLI version bump doesn't take effect | Change `AGS_VERSION` in the `env:` block at the top of the workflow; the `Setup AGS CLI` step reads it from there. The cache key includes the version, so the bump takes effect on the next run. |
 | Deploy rejected as unauthorized | The IAM client is missing a permission. Compare it against the list in the prerequisites — the error response names the permission string it expected. |
 
 Run `ags doctor` locally against the same base URL and client to check config, auth, and connectivity independently of CI.
@@ -227,3 +228,7 @@ Run `ags doctor` locally against the same base URL and client to check config, a
 - `AGS_HOME` is kept outside the workspace by `setup-ags-cli`, so the access token can't be baked into an image layer — see [Runner state and authentication](https://github.com/AccelByte/setup-ags-cli#runner-state-and-authentication) for why that matters.
 - Never move credentials from `secrets` into `vars`. Repository variables are not masked in logs.
 - The `permissions: contents: read` block at the job level is intentional — this workflow never needs write access to the repository.
+
+## License
+
+[MIT](LICENSE.txt)

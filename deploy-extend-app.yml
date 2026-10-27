@@ -21,9 +21,11 @@ on:
         description: 'Image tag to build and deploy (defaults to the commit SHA)'
         required: false
 
-# Serialize deploys: only one runs at a time per branch. A new push waits for
-# the in-flight deploy to finish instead of racing it — otherwise two rollouts
-# to the same app could overlap and the older commit could win. cancel-in-progress
+# Serialize deploys: only one runs at a time per app. A new push waits for the
+# in-flight deploy to finish instead of racing it — otherwise two rollouts to
+# the same app could overlap and the older commit could win. The group is keyed
+# on the app, not the ref, so a manual rollback run from a tag also queues
+# behind a push to main instead of deploying alongside it. cancel-in-progress
 # is false on purpose: killing a rollout mid-flight can leave the app
 # half-updated.
 #
@@ -31,17 +33,24 @@ on:
 # an action — so deleting it silently removes the protection with nothing to
 # put it back.
 concurrency:
-  group: deploy-extend-app-${{ github.ref }}
+  group: deploy-extend-app-${{ vars.AGS_NAMESPACE }}-${{ vars.EXTEND_APP_NAME }}
   cancel-in-progress: false
 
 env:
-  # AGS CLI version to install. Pinned rather than tracking the latest release,
-  # so a CLI regression cannot reach your deploys without you choosing it, and
-  # so re-running an old commit installs the same CLI it originally used.
+  # AGS CLI version to install. 'latest' resolves the newest release at run
+  # time, so CLI fixes arrive without anyone editing this file.
   #
-  # Set this to 'latest' instead if you would rather always get the newest
-  # release and accept that builds stop being reproducible.
-  AGS_VERSION: '0.5.1'
+  # Two things to know about that. Builds stop being reproducible: re-running an
+  # old commit installs today's CLI, not the one that commit was tested with, so
+  # a rollback rebuilds with a different tool than the original deploy used. And
+  # a CLI regression can reach your deploys without you choosing it.
+  #
+  # Pin an exact version (for example 0.5.3) if you need either guarantee.
+  # Written without the 'AGS_VERSION:' prefix on purpose: the Renovate rule in
+  # the README matches that prefix followed by a semver, and RE2 has no
+  # lookbehind to exclude comments — so spelling it out here would have
+  # Renovate opening pull requests that edit this comment.
+  AGS_VERSION: 'latest'
 
   # The namespace the Extend app lives in.
   AGS_NAMESPACE: ${{ vars.AGS_NAMESPACE }}
@@ -83,7 +92,7 @@ jobs:
     steps:
       # Check out the repository. The Docker build context is the repository
       # root, so this has to happen before the image build.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Fail fast on a misconfigured repository. Without this, a missing
       # variable surfaces as a confusing CLI error part-way through a deploy;
@@ -121,6 +130,13 @@ jobs:
           check EXTEND_APP_NAME "$EXTEND_APP"      "The name of an Extend app that already exists."
           if [ -z "${AGS_CLIENT_ID:-}" ] || [ -z "${AGS_CLIENT_SECRET:-}" ]; then
             echo "::error::Missing secret AGS_CLIENT_ID and/or AGS_CLIENT_SECRET. Create a confidential IAM client with the permissions listed in the README prerequisites, then store both under Settings → Secrets and variables → Actions → Secrets."
+            missing=1
+          fi
+          # The tag is typed into the manual-run form and later spliced into a
+          # JSON body, so reject anything that would break the JSON or the
+          # image reference rather than failing obscurely in the CLI.
+          if ! printf '%s' "$IMAGE_TAG" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'; then
+            echo "::error::Invalid image tag '${IMAGE_TAG}'. Use letters, digits, '_', '.' and '-' only (max 128 characters, not starting with '.' or '-')."
             missing=1
           fi
           [ "$missing" -eq 0 ] || exit 1
